@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Spatial Vision AI</title>
+<!--
+  Spatial Vision AI - phone-only app. NO laptop, NO server: the whole AI runs inside the phone.
+    YOLOv8n (objects)  +  MiDaS Small (depth)  ->  VERY CLOSE / MID RANGE / FAR AWAY, LEFT / AHEAD / RIGHT
+  Same models, same thresholds (600 / 300), same alert rules and same sentences as the laptop system
+  (spatial_core.py + alerts.py), run with ONNX Runtime Web (WebAssembly) in the phone's browser.
+
+  Voice commands: "where am I" / "what's around", "pause", "resume", "repeat", "help".
+  Tap anywhere = "where am I".  Models (~80 MB) download once, then the app also works offline.
+-->
+<style>
+  :root {
+    --bg: #000; --panel: #111; --ink: #fff; --muted: #b8b8b8;
+    --accent: #ffd400;          /* high-contrast yellow on black for low-vision users */
+    --danger: #ff3b30; --mid: #ffcc00; --far: #34c759; --line: #333;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; overflow: hidden;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+
+  #start { position: fixed; inset: 0; z-index: 10; background: var(--bg); display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 24px; padding: 24px; text-align: center; }
+  #start h1 { font-size: 28px; letter-spacing: .5px; }
+  #start p { color: var(--muted); font-size: 17px; line-height: 1.45; max-width: 420px; }
+  #startBtn { width: min(72vw, 300px); aspect-ratio: 1; border-radius: 50%; border: 6px solid var(--accent);
+    background: #1a1600; color: var(--accent); font-size: 30px; font-weight: 800; cursor: pointer; }
+  #startBtn:disabled { opacity: .45; }
+  #startBtn:active { transform: scale(.97); }
+  #load { width: min(80vw, 340px); }
+  #loadBar { height: 10px; border-radius: 5px; background: #222; overflow: hidden; }
+  #loadFill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #loadText { margin-top: 8px; color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; }
+  #startErr { color: var(--danger); font-size: 16px; max-width: 420px; }
+
+  #top { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 14px; }
+  #conn { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+  #dot { width: 12px; height: 12px; border-radius: 50%; background: var(--far); }
+  #stats { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  #view { position: relative; flex: 1; min-height: 0; background: #000; }
+  #view video, #view canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #banner { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 16px; font-size: 20px; font-weight: 800;
+    background: rgba(255, 59, 48, .92); color: #fff; display: none; }
+  #paused { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.72); font-size: 34px; font-weight: 800; color: var(--accent); }
+
+  #bottom { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 12px; background: var(--panel);
+    border-top: 1px solid var(--line); }
+  #bottom button { min-height: 64px; border-radius: 14px; font-size: 20px; font-weight: 800; cursor: pointer;
+    border: 3px solid var(--accent); background: #000; color: var(--accent); }
+  #bottom button.on { background: var(--accent); color: #000; }
+  #heard { grid-column: 1 / -1; min-height: 22px; color: var(--muted); font-size: 15px; text-align: center; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+
+<section id="start" aria-label="Start">
+  <h1>Spatial Vision AI</h1>
+  <button id="startBtn" aria-label="Start guidance" disabled>LOADING</button>
+  <div id="load" aria-live="polite">
+    <div id="loadBar"><div id="loadFill"></div></div>
+    <div id="loadText">Preparing…</div>
+  </div>
+  <p>Point the back camera forward. You will hear a warning when something is very close.<br>
+     Say <b>"where am I"</b>, <b>"pause"</b>, <b>"resume"</b>, <b>"repeat"</b> or <b>"help"</b>.
+     Tap the screen to hear what is around you.</p>
+  <div id="startErr" role="alert"></div>
+</section>
+
+<header id="top">
+  <div id="conn"><span id="dot"></span><span>On-device AI</span></div>
+  <div id="stats">– FPS · – ms</div>
+</header>
+
+<main id="view" aria-label="Camera view. Tap to hear what is around you.">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="banner" role="status"></div>
+  <div id="paused">PAUSED</div>
+</main>
+
+<footer id="bottom">
+  <button id="pauseBtn" aria-label="Pause guidance">PAUSE</button>
+  <button id="micBtn" aria-label="Voice commands">VOICE ON</button>
+  <div id="heard" aria-live="polite"></div>
+</footer>
+<div id="live" class="sr" aria-live="assertive"></div>
+
+<script src="ort/ort.wasm.min.js"></script>  <!-- ONNX Runtime Web 1.20.1, kept with the app so it also works offline -->
+<script>
+"use strict";
+// ======================================================================= settings (same as the laptop system)
+const THRESH_HIGH = 600, THRESH_LOW = 300, MIN_CONF = 0.45, IOU = 0.7, ROI_HALF = 15;
+const FRAME_LONG = 640, YOLO_SIZE = 640, MIDAS_SIZE = 256;
+const MAX_REPEATS = 4, GAP_S = 5, COOLDOWN_S = 30, NEW_HAZARD_GAP_S = 2, CLEAR_S = 2, HAZARD_MEMORY_S = 10;
+const MAX_OBJECTS_IN_SENTENCE = 3;
+const COLORS = { "VERY CLOSE": "#ff3b30", "MID RANGE": "#ffcc00", "FAR AWAY": "#34c759" };
+const DIRECTIONS = { LEFT: "on your left", AHEAD: "ahead", RIGHT: "on your right" };
+const MODEL_FILES = { yolo: ["models/yolov8n.onnx"],
+  midas: ["models/midas_small.onnx.part1", "models/midas_small.onnx.part2", "models/midas_small.onnx.part3"] };
+const MODEL_CACHE = "svai-models-v1";
+const NAMES = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
+  "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow","elephant","bear",
+  "zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+  "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle","wine glass","cup",
+  "fork","knife","spoon","bowl","banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza","donut",
+  "cake","chair","couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote","keyboard",
+  "cell phone","microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear",
+  "hair drier","toothbrush"];
+
+// ======================================================================= state
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const frameC = document.createElement("canvas"), fctx = frameC.getContext("2d", { willReadFrequently: true });
+const yoloC = document.createElement("canvas"), yctx = yoloC.getContext("2d", { willReadFrequently: true });
+yoloC.width = yoloC.height = YOLO_SIZE;
+let yolo = null, midas = null, running = false, paused = false, busy = false, ready = false;
+let last = { detections: [], alert: null, width: 640, height: 480 };
+let fps = 0, lastFrameT = 0, procMs = 0;
+window.__spoken = [];                         // test hook: everything the app said
+
+// ======================================================================= model download (once, then cached)
+async function fetchCached(url, onBytes) {
+  let cache = null;
+  try { cache = await caches.open(MODEL_CACHE); } catch (_) {}
+  const hit = cache && await cache.match(url);
+  if (hit) { const b = await hit.arrayBuffer(); onBytes(b.byteLength); return new Uint8Array(b); }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const reader = res.body.getReader(), chunks = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); n += value.length; onBytes(value.length);
+  }
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  if (cache) { try { await cache.put(url, new Response(out.slice())); } catch (_) {} }
+  return out;
+}
+
+async function loadModels() {
+  const TOTAL = 12824165 + 66392553;          // bytes, for the progress bar
+  let got = 0;
+  const onBytes = k => {
+    got += k;
+    const p = Math.min(100, 100 * got / TOTAL);
+    $("loadFill").style.width = p.toFixed(0) + "%";
+    $("loadText").textContent = `Downloading AI models… ${(got / 1e6).toFixed(0)} / ${(TOTAL / 1e6).toFixed(0)} MB`;
+  };
+  const join = parts => {
+    const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  };
+  const yoloBytes = join(await Promise.all(MODEL_FILES.yolo.map(u => fetchCached(u, onBytes))));
+  const midasBytes = join(await Promise.all(MODEL_FILES.midas.map(u => fetchCached(u, onBytes))));
+  $("loadText").textContent = "Starting AI…";
+  ort.env.wasm.wasmPaths = new URL("ort/", location.href).href;
+  // several CPU cores only when the page is "cross-origin isolated" (sw.js adds the needed headers)
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+  const opt = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
+  yolo = await ort.InferenceSession.create(yoloBytes, opt);
+  midas = await ort.InferenceSession.create(midasBytes, opt);
+}
+
+// ======================================================================= the AI (port of spatial_core.py)
+function letterboxTensor(src, W, H) {
+  // YOLOv8 input: frame scaled into a 640x640 square, grey (114) borders, RGB 0..1, CHW
+  const r = Math.min(YOLO_SIZE / W, YOLO_SIZE / H), nw = Math.round(W * r), nh = Math.round(H * r);
+  const px = (YOLO_SIZE - nw) / 2, py = (YOLO_SIZE - nh) / 2;
+  yctx.fillStyle = "rgb(114,114,114)"; yctx.fillRect(0, 0, YOLO_SIZE, YOLO_SIZE);
+  yctx.drawImage(src, 0, 0, W, H, Math.round(px - 0.1), Math.round(py - 0.1), nw, nh);
+  const d = yctx.getImageData(0, 0, YOLO_SIZE, YOLO_SIZE).data, N = YOLO_SIZE * YOLO_SIZE;
+  const t = new Float32Array(3 * N);
+  for (let i = 0; i < N; i++) { t[i] = d[4 * i] / 255; t[N + i] = d[4 * i + 1] / 255; t[2 * N + i] = d[4 * i + 2] / 255; }
+  return { tensor: new ort.Tensor("float32", t, [1, 3, YOLO_SIZE, YOLO_SIZE]), r, px: Math.round(px - 0.1), py: Math.round(py - 0.1) };
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]), x2 = Math.min(a[2], b[2]), y2 = Math.min(a[3], b[3]);
+  const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i + 1e-9);
+}
+
+async function detect(W, H) {
+  const { tensor, r, px, py } = letterboxTensor(frameC, W, H);
+  const out = (await yolo.run({ [yolo.inputNames[0]]: tensor }))[yolo.outputNames[0]];
+  const [, C, A] = out.dims, o = out.data;               // [1, 84, anchors]
+  const cand = [];
+  for (let a = 0; a < A; a++) {
+    let best = 0, cls = -1;
+    for (let c = 4; c < C; c++) { const s = o[c * A + a]; if (s > best) { best = s; cls = c - 4; } }
+    if (best < MIN_CONF) continue;
+    const cx = o[a], cy = o[A + a], w = o[2 * A + a], h = o[3 * A + a];
+    cand.push({ cls, conf: best, box: [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2] });
+  }
+  cand.sort((p, q) => q.conf - p.conf);
+  const keep = [];
+  for (const c of cand) {                                 // per-class NMS, IoU 0.7 (Ultralytics default)
+    if (keep.some(k => k.cls === c.cls && iou(k.box, c.box) > IOU)) continue;
+    keep.push(c);
+    if (keep.length >= 300) break;
+  }
+  const clip = (v, m) => Math.max(0, Math.min(m, v));
+  return keep.map(k => ({ cls: k.cls, conf: k.conf, box: [
+    clip((k.box[0] - px) / r, W), clip((k.box[1] - py) / r, H), clip((k.box[2] - px) / r, W), clip((k.box[3] - py) / r, H)] }));
+}
+
+function midasSize(W, H) {
+  // MiDaS small_transform: fit inside 256x256 keeping aspect ratio, sides multiples of 32
+  const s = Math.min(MIDAS_SIZE / W, MIDAS_SIZE / H);
+  const m32 = (x, max) => { let y = Math.round(x / 32) * 32; if (y > max) y = Math.floor(x / 32) * 32; return Math.max(32, y); };
+  return [m32(W * s, MIDAS_SIZE), m32(H * s, MIDAS_SIZE)];
+}
+
+function cubicTaps(n, m) {
+  // OpenCV INTER_CUBIC (a = -0.75, no anti-aliasing) - the same resize the laptop's MiDaS transform uses.
+  // The browser's own canvas resize is smoother and changes the depth values by up to 20 %.
+  const A = -0.75, scale = n / m, idx = new Int32Array(4 * m), w = new Float32Array(4 * m);
+  for (let j = 0; j < m; j++) {
+    const f = (j + 0.5) * scale - 0.5, s = Math.floor(f), x = f - s;
+    const c = [((A * (x + 1) - 5 * A) * (x + 1) + 8 * A) * (x + 1) - 4 * A,
+               ((A + 2) * x - (A + 3)) * x * x + 1,
+               ((A + 2) * (1 - x) - (A + 3)) * (1 - x) * (1 - x) + 1, 0];
+    c[3] = 1 - c[0] - c[1] - c[2];
+    for (let k = 0; k < 4; k++) { idx[4 * j + k] = Math.max(0, Math.min(n - 1, s - 1 + k)); w[4 * j + k] = c[k]; }
+  }
+  return { idx, w };
+}
+let tapCache = {};
+function resizeCubic(d, W, H, mw, mh) {
+  // RGBA bytes (W x H) -> float RGB 0..1 (mw x mh), separable bicubic
+  const key = `${W}x${H}>${mw}x${mh}`;
+  const taps = tapCache[key] || (tapCache = { [key]: { tx: cubicTaps(W, mw), ty: cubicTaps(H, mh) } })[key];
+  const { tx, ty } = taps, tmp = new Float32Array(3 * mw * H), out = new Float32Array(3 * mw * mh);
+  for (let y = 0; y < H; y++)
+    for (let j = 0; j < mw; j++)
+      for (let c = 0; c < 3; c++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += tx.w[4 * j + k] * d[4 * (y * W + tx.idx[4 * j + k]) + c];
+        tmp[3 * (y * mw + j) + c] = s;
+      }
+  for (let i = 0; i < mh; i++)
+    for (let j = 0; j < mw; j++)
+      for (let c = 0; c < 3; c++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += ty.w[4 * i + k] * tmp[3 * (ty.idx[4 * i + k] * mw + j) + c];
+        out[3 * (i * mw + j) + c] = s / 255;
+      }
+  return out;
+}
+
+async function depthMap(W, H) {
+  const [mw, mh] = midasSize(W, H);
+  const rgb = resizeCubic(fctx.getImageData(0, 0, W, H).data, W, H, mw, mh);
+  const N = mw * mh, t = new Float32Array(3 * N);
+  const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+  for (let i = 0; i < N; i++)
+    for (let c = 0; c < 3; c++) t[c * N + i] = (rgb[3 * i + c] - mean[c]) / std[c];
+  const out = (await midas.run({ image: new ort.Tensor("float32", t, [1, 3, mh, mw]) }))[midas.outputNames[0]];
+  return { data: out.data, mw, mh };
+}
+
+function depthAt(dm, W, H, x, y) {
+  // bilinear sample of the small depth map at frame pixel (x, y)  (the laptop upsamples the whole map)
+  const u = Math.max(0, Math.min(dm.mw - 1, (x + 0.5) * dm.mw / W - 0.5));
+  const v = Math.max(0, Math.min(dm.mh - 1, (y + 0.5) * dm.mh / H - 0.5));
+  const x0 = Math.floor(u), y0 = Math.floor(v), x1 = Math.min(x0 + 1, dm.mw - 1), y1 = Math.min(y0 + 1, dm.mh - 1);
+  const fx = u - x0, fy = v - y0, D = dm.data, w = dm.mw;
+  return (D[y0 * w + x0] * (1 - fx) + D[y0 * w + x1] * fx) * (1 - fy) + (D[y1 * w + x0] * (1 - fx) + D[y1 * w + x1] * fx) * fy;
+}
+
+function median(a) {
+  a.sort((p, q) => p - q);
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+const classify = v => v > THRESH_HIGH ? "VERY CLOSE" : v >= THRESH_LOW ? "MID RANGE" : "FAR AWAY";
+
+async function analyze(W, H) {
+  const t0 = performance.now();
+  const dm = await depthMap(W, H);
+  const t1 = performance.now();
+  const boxes = await detect(W, H);
+  window.__timing = { depth_ms: Math.round(t1 - t0), yolo_ms: Math.round(performance.now() - t1) };
+  return boxes.map(b => {
+    const [x1, y1, x2, y2] = b.box.map(v => Math.trunc(v));
+    const cx = Math.floor((x1 + x2) / 2), cy = Math.floor((y1 + y2) / 2);
+    const vals = [];
+    for (let y = Math.max(0, cy - ROI_HALF); y < Math.min(H, cy + ROI_HALF); y++)
+      for (let x = Math.max(0, cx - ROI_HALF); x < Math.min(W, cx + ROI_HALF); x++) vals.push(depthAt(dm, W, H, x, y));
+    const v = vals.length ? median(vals) : depthAt(dm, W, H, cx, cy);   // median: robust to noisy pixels
+    const sector = ["LEFT", "AHEAD", "RIGHT"][Math.min(Math.floor(3 * cx / W), 2)];
+    const row = ["TOP", "MIDDLE", "BOTTOM"][Math.min(Math.floor(3 * cy / H), 2)];
+    return { label: NAMES[b.cls], conf: +b.conf.toFixed(2), bbox: [x1, y1, x2, y2], center: [cx, cy],
+             depth_val: +v.toFixed(1), status: classify(v), sector, grid: `${row}-${sector}`, direction: DIRECTIONS[sector] };
+  });
+}
+
+window.__analyzeUrl = async url => {          // test hook: run the AI on a still image
+  const im = new Image(); im.src = url; await im.decode();
+  frameC.width = im.naturalWidth; frameC.height = im.naturalHeight; fctx.drawImage(im, 0, 0);
+  return analyze(frameC.width, frameC.height);
+};
+
+// ======================================================================= speech output
+const synth = window.speechSynthesis;
+let voice = null;
+function pickVoice() {
+  const vs = synth ? synth.getVoices() : [];
+  voice = vs.find(v => /en[-_]IN/i.test(v.lang)) || vs.find(v => /^en/i.test(v.lang)) || null;
+}
+if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
+
+let speakingUntil = 0;   // fallback when the browser never fires "end"
+function isSpeaking() { return (synth && synth.speaking) || performance.now() < speakingUntil; }
+function say(text, { interrupt = false } = {}) {
+  window.__spoken.push({ t: Math.round(performance.now()), text });
+  $("live").textContent = text;               // screen readers (TalkBack / VoiceOver) also get it
+  if (!synth) return;
+  if (interrupt) synth.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  if (voice) u.voice = voice;
+  u.lang = voice ? voice.lang : "en-US";
+  u.rate = 1.05;
+  speakingUntil = performance.now() + 450 + 65 * text.length;
+  u.onend = u.onerror = () => { speakingUntil = 0; };
+  synth.speak(u);
+}
+
+// ======================================================================= alert sentence (same as alerts.py)
+const PLURAL = { person: "people", bus: "buses", couch: "couches", bench: "benches" };
+function hazards(dets) {
+  return dets.filter(d => d.status === "VERY CLOSE")
+             .sort((a, b) => b.depth_val - a.depth_val).slice(0, MAX_OBJECTS_IN_SENTENCE);
+}
+function hazardKey(dets) { return hazards(dets).map(d => `${d.label}:${d.sector}`).sort(); }
+function buildAlert(dets) {
+  const groups = new Map();
+  for (const d of hazards(dets)) {
+    const k = `${d.label}|${d.direction}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(d);
+  }
+  if (!groups.size) return null;
+  const parts = [...groups].map(([k, ds]) => {
+    const [label, dir] = k.split("|");
+    return ds.length === 1 ? `${label} ${dir}` : `${ds.length} ${PLURAL[label] || label + "s"} ${dir}`;
+  });
+  const single = parts.length === 1 && [...groups.values()][0].length === 1;
+  return `Warning! ${parts.join(", and ")}, ${single ? "is" : "are"} very close!`;
+}
+
+// ======================================================================= alert timing (same as AlertManager)
+const am = { seen: {}, count: 0, last: -1e9, clearSince: null, recent: [] };
+function updateAlerts(dets, alertText) {
+  const now = performance.now() / 1000;
+  am.recent = [...am.recent, new Set(hazardKey(dets))].slice(-3);   // debounce: 2 of the last 3 frames
+  const key = [...am.recent[am.recent.length - 1]].filter(k => am.recent.filter(r => r.has(k)).length >= 2).sort();
+  if (!key.length) {
+    if (am.clearSince === null) am.clearSince = now;
+    if (now - am.clearSince >= CLEAR_S) am.count = 0;
+    return;
+  }
+  am.clearSince = null;
+  let gap = GAP_S;
+  if (key.some(k => now - (am.seen[k] ?? -1e9) > HAZARD_MEMORY_S)) { am.count = 0; gap = NEW_HAZARD_GAP_S; }
+  for (const k of key) am.seen[k] = now;
+  if (am.count >= MAX_REPEATS) {
+    if (now - am.last >= COOLDOWN_S) am.count = 0; else return;
+  }
+  if (now - am.last >= gap && !isSpeaking() && alertText) {
+    say(alertText);
+    am.count += 1; am.last = now;
+    if (navigator.vibrate) navigator.vibrate([180, 80, 180]);
+  }
+}
+
+// ======================================================================= "where am I"
+function describe() {
+  const dets = last.detections || [];
+  if (!ready) return "The AI is still starting. Please wait a moment.";
+  if (!dets.length) return "I don't see any objects right now. The path looks clear.";
+  const groups = {};
+  for (const d of dets) { const k = `${d.label}|${d.direction}`; (groups[k] = groups[k] || []).push(d); }
+  const parts = Object.entries(groups)
+    .sort((a, b) => Math.max(...b[1].map(d => d.depth_val)) - Math.max(...a[1].map(d => d.depth_val)))
+    .slice(0, 4)
+    .map(([k, ds]) => {
+      const [label, dir] = k.split("|");
+      return `${ds.length > 1 ? `${ds.length} ${PLURAL[label] || label + "s"}` : `a ${label}`} ${dir}`;
+    });
+  const c = [...dets].sort((a, b) => b.depth_val - a.depth_val)[0];
+  const level = { "VERY CLOSE": "very close", "MID RANGE": "at middle distance", "FAR AWAY": "far away" }[c.status];
+  return `I see ${parts.join(", ")}. The closest is the ${c.label} ${c.direction}, ${level}.`;
+}
+
+// ======================================================================= commands
+function handleCommand(raw) {
+  const t = raw.toLowerCase();
+  $("heard").textContent = `Heard: "${raw}"`;
+  if (/(where am i|what('| i)?s around|around me|describe|what do you see)/.test(t)) say(describe(), { interrupt: true });
+  else if (/\b(pause|stop|quiet|silence)\b/.test(t)) setPaused(true);
+  else if (/\b(start|resume|continue|go)\b/.test(t)) setPaused(false);
+  else if (/\b(repeat|again)\b/.test(t)) say(last.alert || "No warning right now.", { interrupt: true });
+  else if (/\bhelp\b/.test(t)) say("Say: where am I, pause, resume, or repeat. Tap the screen to hear what is around you.", { interrupt: true });
+  else { say("Sorry, I did not understand. Say help to hear the commands.", { interrupt: true }); return false; }
+  return true;
+}
+window.handleCommand = handleCommand;        // test hook
+
+function setPaused(p) {
+  paused = p;
+  $("paused").style.display = p ? "flex" : "none";
+  $("pauseBtn").textContent = p ? "RESUME" : "PAUSE";
+  $("pauseBtn").classList.toggle("on", p);
+  $("pauseBtn").setAttribute("aria-label", p ? "Resume guidance" : "Pause guidance");
+  say(p ? "Guidance paused." : "Guidance resumed.", { interrupt: true });
+}
+
+// ======================================================================= voice recognition
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, micOn = false;
+function startMic() {
+  if (!SR) { $("micBtn").textContent = "NO VOICE INPUT"; $("micBtn").disabled = true; return; }
+  rec = new SR();
+  rec.lang = "en-IN"; rec.continuous = true; rec.interimResults = false;
+  rec.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++)
+      if (e.results[i].isFinal) handleCommand(e.results[i][0].transcript.trim());
+  };
+  rec.onend = () => { if (micOn) setTimeout(() => { try { rec.start(); } catch (_) {} }, 300); };
+  rec.onerror = e => { if (e.error === "not-allowed") { micOn = false; updateMicBtn(); } };
+  micOn = true; updateMicBtn();
+  try { rec.start(); } catch (_) {}
+}
+function updateMicBtn() {
+  $("micBtn").textContent = micOn ? "VOICE ON" : "VOICE OFF";
+  $("micBtn").classList.toggle("on", micOn);
+}
+
+// ======================================================================= camera -> AI loop
+async function loop() {
+  if (!running) return;
+  if (paused || busy || !video.videoWidth) { requestAnimationFrame(loop); return; }
+  busy = true;
+  try {
+    const s = FRAME_LONG / Math.max(video.videoWidth, video.videoHeight);
+    const W = Math.round(video.videoWidth * s), H = Math.round(video.videoHeight * s);
+    if (frameC.width !== W || frameC.height !== H) { frameC.width = W; frameC.height = H; }
+    fctx.drawImage(video, 0, 0, W, H);
+    const t0 = performance.now();
+    const dets = await analyze(W, H);
+    const now = performance.now();
+    procMs = now - t0;
+    if (lastFrameT) fps = fps ? 0.8 * fps + 0.2 * (1000 / (now - lastFrameT)) : 1000 / (now - lastFrameT);
+    lastFrameT = now;
+    last = { detections: dets, alert: buildAlert(dets), width: W, height: H };
+    window.__last = last;                       // test hook
+    draw();
+    $("stats").textContent = `${fps.toFixed(1)} FPS · ${Math.round(procMs)} ms`;
+    $("banner").style.display = last.alert ? "block" : "none";
+    $("banner").textContent = last.alert || "";
+    if (!paused) updateAlerts(dets, last.alert);
+  } catch (e) {
+    $("heard").textContent = "AI error: " + e.message;
+  }
+  busy = false;
+  requestAnimationFrame(loop);
+}
+
+// ======================================================================= drawing
+function draw() {
+  const r = overlay.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  overlay.width = r.width * dpr; overlay.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+  const s = Math.min(r.width / last.width, r.height / last.height);
+  const ox = (r.width - last.width * s) / 2, oy = (r.height - last.height * s) / 2;
+  ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1;
+  for (const k of [1, 2]) {
+    ctx.beginPath(); ctx.moveTo(ox + k * last.width * s / 3, oy); ctx.lineTo(ox + k * last.width * s / 3, oy + last.height * s); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ox, oy + k * last.height * s / 3); ctx.lineTo(ox + last.width * s, oy + k * last.height * s / 3); ctx.stroke();
+  }
+  ctx.font = "bold 14px system-ui, sans-serif";
+  for (const d of last.detections) {
+    const [x1, y1, x2, y2] = d.bbox, c = COLORS[d.status] || "#fff";
+    ctx.strokeStyle = c; ctx.lineWidth = 3;
+    ctx.strokeRect(ox + x1 * s, oy + y1 * s, (x2 - x1) * s, (y2 - y1) * s);
+    const tag = `${d.label} · ${d.status.toLowerCase()}`;
+    const tw = ctx.measureText(tag).width + 10, ty = Math.max(oy + y1 * s - 22, oy);
+    const tx = Math.max(0, Math.min(ox + x1 * s, r.width - tw));
+    ctx.fillStyle = c; ctx.fillRect(tx, ty, tw, 22);
+    ctx.fillStyle = "#000"; ctx.fillText(tag, tx + 5, ty + 16);
+  }
+}
+
+// ======================================================================= start
+async function start() {
+  $("startErr").textContent = "";
+  if (!window.isSecureContext) { $("startErr").textContent = "The camera needs an https:// page."; return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    $("startErr").textContent = "Camera not available: " + e.message + ". Allow camera access and try again.";
+    return;
+  }
+  $("start").style.display = "none";
+  running = true;
+  say("Guidance started. Say where am I at any time.");
+  try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (_) {}
+  startMic();
+  requestAnimationFrame(loop);
+}
+
+$("startBtn").addEventListener("click", start);
+$("pauseBtn").addEventListener("click", () => setPaused(!paused));
+$("micBtn").addEventListener("click", () => {
+  if (!rec) return startMic();
+  micOn = !micOn; updateMicBtn();
+  if (micOn) { try { rec.start(); } catch (_) {} } else rec.stop();
+});
+$("view").addEventListener("click", () => say(describe(), { interrupt: true }));
+window.addEventListener("resize", draw);
+document.addEventListener("visibilitychange", async () => {   // the wake lock is dropped when the app is hidden
+  if (!document.hidden && running) { try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (_) {} }
+});
+
+// sw.js: offline use + the headers that allow multi-core AI. The very first visit is not isolated yet,
+// so the page reloads itself once as soon as sw.js is in control.
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register("sw.js").then(() => {
+    if (self.crossOriginIsolated) return;
+    const reloadOnce = () => {
+      try { if (sessionStorage.getItem("svai-reloaded")) return; sessionStorage.setItem("svai-reloaded", "1"); } catch (_) { return; }
+      location.reload();
+    };
+    if (navigator.serviceWorker.controller) reloadOnce();
+    else navigator.serviceWorker.addEventListener("controllerchange", reloadOnce);
+  }).catch(() => {});
+}
+
+loadModels().then(() => {
+  ready = true;
+  $("load").style.display = "none";
+  $("startBtn").disabled = false;
+  $("startBtn").textContent = "START";
+}).catch(e => {
+  $("loadText").textContent = "";
+  $("startErr").textContent = "Could not load the AI models (" + e.message + "). Check the internet and reload the page.";
+});
+</script>
+</body>
+</html>
