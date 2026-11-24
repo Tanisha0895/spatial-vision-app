@@ -44,6 +44,8 @@
   #loadFill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   #loadText { margin-top: 8px; color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; }
   #startErr { color: var(--danger); font-size: 16px; max-width: 420px; }
+  #sensBtn { padding: 12px 20px; border-radius: 12px; border: 2px solid var(--accent); background: #000;
+    color: var(--accent); font-size: 17px; font-weight: 700; cursor: pointer; }
 
   #top { display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 14px; }
@@ -79,6 +81,7 @@
   <p>Point the back camera forward. You will hear a warning when something is very close.<br>
      Say <b>"where am I"</b>, <b>"pause"</b>, <b>"resume"</b>, <b>"repeat"</b> or <b>"help"</b>.
      Tap the screen to hear what is around you.</p>
+  <button id="sensBtn" aria-label="Change warning sensitivity"></button>
   <div id="startErr" role="alert"></div>
 </section>
 
@@ -105,15 +108,21 @@
 <script>
 "use strict";
 // ======================================================================= settings (same as the laptop system)
-const THRESH_HIGH = 600, THRESH_LOW = 300, MIN_CONF = 0.45, IOU = 0.7, ROI_HALF = 15;
-const FRAME_LONG = 640, YOLO_SIZE = 640, MIDAS_SIZE = 256;
+const MIN_CONF = 0.45, IOU = 0.7, ROI_HALF = 15;
+const FRAME_LONG = 640, YOLO_SIZE = 416,   // 416 instead of 640: 2.5x faster, close obstacles are big anyway
+      MIDAS_SIZE = 256;
 const MAX_REPEATS = 4, GAP_S = 5, COOLDOWN_S = 30, NEW_HAZARD_GAP_S = 2, CLEAR_S = 2, HAZARD_MEMORY_S = 10;
 const MAX_OBJECTS_IN_SENTENCE = 3;
 const COLORS = { "VERY CLOSE": "#ff3b30", "MID RANGE": "#ffcc00", "FAR AWAY": "#34c759" };
 const DIRECTIONS = { LEFT: "on your left", AHEAD: "ahead", RIGHT: "on your right" };
 const MODEL_FILES = { yolo: ["models/yolov8n.onnx"],
   midas: ["models/midas_small.onnx.part1", "models/midas_small.onnx.part2", "models/midas_small.onnx.part3"] };
-const MODEL_CACHE = "svai-models-v1";
+const MODEL_CACHE = "svai-models-v2";
+// Distance thresholds on the raw MiDaS value (bigger = closer). NORMAL = the laptop system's values.
+// HIGH warns earlier (useful if the phone camera sees things as farther away than the laptop webcam).
+const SENSITIVITY = { normal: [600, 300], high: [450, 225] };
+let sens = "normal";
+try { sens = localStorage.getItem("svai-sens") === "high" ? "high" : "normal"; } catch (_) {}
 const NAMES = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
   "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow","elephant","bear",
   "zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
@@ -157,7 +166,7 @@ async function fetchCached(url, onBytes) {
 }
 
 async function loadModels() {
-  const TOTAL = 12824165 + 66392553;          // bytes, for the progress bar
+  const TOTAL = 12727141 + 66392553;          // bytes, for the progress bar
   let got = 0;
   const onBytes = k => {
     got += k;
@@ -295,7 +304,7 @@ function median(a) {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
 
-const classify = v => v > THRESH_HIGH ? "VERY CLOSE" : v >= THRESH_LOW ? "MID RANGE" : "FAR AWAY";
+const classify = v => { const [hi, lo] = SENSITIVITY[sens]; return v > hi ? "VERY CLOSE" : v >= lo ? "MID RANGE" : "FAR AWAY"; };
 
 async function analyze(W, H) {
   const t0 = performance.now();
@@ -368,7 +377,16 @@ function buildAlert(dets) {
     return ds.length === 1 ? `${label} ${dir}` : `${ds.length} ${PLURAL[label] || label + "s"} ${dir}`;
   });
   const single = parts.length === 1 && [...groups.values()][0].length === 1;
-  return `Warning! ${parts.join(", and ")}, ${single ? "is" : "are"} very close!`;
+  return `Warning! ${parts.join(", and ")}, ${single ? "is" : "are"} very close!${sideHint(dets)}`;
+}
+
+function sideHint(dets) {
+  // something very close AHEAD -> suggest the side whose closest object is farther away
+  if (!hazards(dets).some(d => d.sector === "AHEAD")) return "";
+  const near = sec => Math.max(0, ...dets.filter(d => d.sector === sec).map(d => d.depth_val));
+  const [hi] = SENSITIVITY[sens], l = near("LEFT"), r = near("RIGHT");
+  if (l > hi && r > hi) return " Stop.";
+  return l <= r ? " Move to your left." : " Move to your right.";
 }
 
 // ======================================================================= alert timing (same as AlertManager)
@@ -420,14 +438,25 @@ function handleCommand(raw) {
   const t = raw.toLowerCase();
   $("heard").textContent = `Heard: "${raw}"`;
   if (/(where am i|what('| i)?s around|around me|describe|what do you see)/.test(t)) say(describe(), { interrupt: true });
+  else if (/(more sensitive|high sensitivity|sensitive)/.test(t) && !/less|normal/.test(t)) setSens("high", true);
+  else if (/(less sensitive|normal sensitivity)/.test(t)) setSens("normal", true);
   else if (/\b(pause|stop|quiet|silence)\b/.test(t)) setPaused(true);
   else if (/\b(start|resume|continue|go)\b/.test(t)) setPaused(false);
   else if (/\b(repeat|again)\b/.test(t)) say(last.alert || "No warning right now.", { interrupt: true });
-  else if (/\bhelp\b/.test(t)) say("Say: where am I, pause, resume, or repeat. Tap the screen to hear what is around you.", { interrupt: true });
+  else if (/\bhelp\b/.test(t)) say("Say: where am I, pause, resume, repeat, more sensitive, or less sensitive. Tap the screen to hear what is around you.", { interrupt: true });
   else { say("Sorry, I did not understand. Say help to hear the commands.", { interrupt: true }); return false; }
   return true;
 }
 window.handleCommand = handleCommand;        // test hook
+
+function setSens(v, speak) {
+  sens = v;
+  try { localStorage.setItem("svai-sens", v); } catch (_) {}
+  $("sensBtn").textContent = `Warning distance: ${v === "high" ? "EARLY" : "NORMAL"}`;
+  if (speak) say(v === "high" ? "Warnings will come earlier." : "Normal warning distance.", { interrupt: true });
+}
+setSens(sens, false);
+$("sensBtn").addEventListener("click", () => setSens(sens === "high" ? "normal" : "high", true));
 
 function setPaused(p) {
   paused = p;
@@ -507,7 +536,7 @@ function draw() {
     const [x1, y1, x2, y2] = d.bbox, c = COLORS[d.status] || "#fff";
     ctx.strokeStyle = c; ctx.lineWidth = 3;
     ctx.strokeRect(ox + x1 * s, oy + y1 * s, (x2 - x1) * s, (y2 - y1) * s);
-    const tag = `${d.label} · ${d.status.toLowerCase()}`;
+    const tag = `${d.label} · ${d.status.toLowerCase()} (${Math.round(d.depth_val)})`;   // number = raw depth, for calibration
     const tw = ctx.measureText(tag).width + 10, ty = Math.max(oy + y1 * s - 22, oy);
     const tx = Math.max(0, Math.min(ox + x1 * s, r.width - tw));
     ctx.fillStyle = c; ctx.fillRect(tx, ty, tw, 22);
@@ -565,6 +594,8 @@ if ("serviceWorker" in navigator && window.isSecureContext) {
 
 loadModels().then(() => {
   ready = true;
+  caches.keys().then(ks => ks.filter(k => k.startsWith("svai-models-") && k !== MODEL_CACHE)
+    .forEach(k => caches.delete(k))).catch(() => {});      // free the space of older model versions
   $("load").style.display = "none";
   $("startBtn").disabled = false;
   $("startBtn").textContent = "START";
